@@ -1,0 +1,1204 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Set up environment"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "metadata": {
+    "scrolled": true
+   },
+   "outputs": [],
+   "source": [
+    "%%init_spark\n",
+    "launcher.master=\"yarn\"\n",
+    "launcher.num_executors=6\n",
+    "launcher.executor_cores=2\n",
+    "launcher.executor_memory='6000m'"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Import packages and set configuration"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "Intitializing Scala interpreter ..."
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    },
+    {
+     "data": {
+      "text/plain": [
+       "Spark Web UI available at http://bd-hm:8088/proxy/application_1574191321095_0006\n",
+       "SparkContext available as 'sc' (version = 2.4.4, master = yarn, app id = application_1574191321095_0006)\n",
+       "SparkSession available as 'spark'\n"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    },
+    {
+     "data": {
+      "text/plain": [
+       "import org.apache.spark.graphx._\n",
+       "import org.apache.hadoop.conf._\n",
+       "import org.apache.hadoop.io._\n",
+       "import org.apache.hadoop.mapreduce.lib.input._\n",
+       "hadoopConf: org.apache.hadoop.conf.Configuration = Configuration: core-default.xml, core-site.xml, mapred-default.xml, mapred-site.xml, yarn-default.xml, yarn-site.xml, hdfs-default.xml, hdfs-site.xml\n"
+      ]
+     },
+     "execution_count": 2,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "import org.apache.spark.graphx._\n",
+    "import org.apache.hadoop.conf._\n",
+    "import org.apache.hadoop.io._\n",
+    "import org.apache.hadoop.mapreduce.lib.input._\n",
+    "@transient val hadoopConf=new Configuration\n",
+    "hadoopConf.set(\"textinputformat.record.delimiter\",\"#*\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Step 1. Build ACM Citation Network"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Read in ACM Citation data and inspect"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "inputrdd: org.apache.spark.rdd.RDD[String] = MapPartitionsRDD[2] at filter at <console>:39\n"
+      ]
+     },
+     "execution_count": 3,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "val inputrdd=sc.newAPIHadoopFile(\"hdfs://bd-hm:9000/hadoop-user/data/citation-acm-v8.txt\", classOf[TextInputFormat], classOf[LongWritable], classOf[Text], hadoopConf).map{case(key,value)=>value.toString}.filter(value=>value.length!=0)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "INFORMS Journal on Computing\n",
+      "#t2014\n",
+      "#cINFORMS Journal on Computing\n",
+      "#index558ac6e0612c41e6b9d39eed\n",
+      "\n",
+      "\n",
+      "Pushout-complements and basic concepts of grammars in toposes\n",
+      "#@Yasuo Kawahara\n",
+      "#t1990\n",
+      "#cTheoretical Computer Science\n",
+      "#index5390879920f70186a0d422b8\n",
+      "\n",
+      "\n"
+     ]
+    }
+   ],
+   "source": [
+    "inputrdd.take(2).foreach(println)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Parse out different data elements, and keep only those that related to the main index (#index), and the reference indexes (#%)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "(Inside risks: the clock grows at midnight\n",
+      ",#%5390877920f70186a0d2ce74)\n",
+      "(Lower bounds for the union-find and the split-find problem on pointer machines\n",
+      ",#%5390877920f70186a0d2cdc1)\n",
+      "(INFORMS Journal on Computing\n",
+      ",#index558ac6e0612c41e6b9d39eed)\n",
+      "(Pushout-complements and basic concepts of grammars in toposes\n",
+      ",#index5390879920f70186a0d422b8)\n"
+     ]
+    },
+    {
+     "data": {
+      "text/plain": [
+       "pairs: org.apache.spark.rdd.RDD[(String, String)] = MapPartitionsRDD[4] at flatMapValues at <console>:38\n",
+       "ref: org.apache.spark.rdd.RDD[(String, String)] = MapPartitionsRDD[5] at filter at <console>:40\n",
+       "index: org.apache.spark.rdd.RDD[(String, String)] = MapPartitionsRDD[6] at filter at <console>:41\n"
+      ]
+     },
+     "execution_count": 5,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "val pairs=inputrdd.map(line=>(line.split(\"#\")(0), line)).flatMapValues(l=>l.split(\"\\n\"))\n",
+    "\n",
+    "val ref= pairs.filter((k) =>  k._2.contains(\"#%\"))\n",
+    "val index=pairs.filter((k) =>  k._2.contains(\"#index\"))\n",
+    "ref.take(2).foreach(println)\n",
+    "index.take(2).foreach(println)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Rename columns and save index and reference data frames as tables"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "idx_cols: Seq[String] = List(id, idx)\n",
+       "ref_cols: Seq[String] = List(id, ref)\n"
+      ]
+     },
+     "execution_count": 6,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "val idx_cols=Seq(\"id\", \"idx\")\n",
+    "index.toDF(idx_cols:_*).createOrReplaceTempView(\"index\")\n",
+    "\n",
+    "val ref_cols=Seq(\"id\", \"ref\")\n",
+    "ref.toDF(ref_cols:_*).createOrReplaceTempView(\"ref\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Remove special characters, and join together index and reference data based on the paper title"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "spark.sql(\"select id, replace(ref, '#%', '') ref from ref\").createOrReplaceTempView(\"ref\")\n",
+    "spark.sql(\"select id, replace(idx, '#index', '') idx from index\").createOrReplaceTempView(\"index\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 8,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "mrg: org.apache.spark.sql.DataFrame = [idx: string, ref: string]\n"
+      ]
+     },
+     "execution_count": 8,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "val mrg = spark.sql(\"select index.idx, ref.ref from index left join ref on index.id=ref.id where ref.ref is not null\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Save data as table"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 9,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "mrg.createOrReplaceTempView(\"mrg\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Inspect data"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 10,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "+--------------------+--------------------+\n",
+      "|        paper_index1|        paper_index2|\n",
+      "+--------------------+--------------------+\n",
+      "|5390ad8920f70186a...|539099a220f70186a...|\n",
+      "|5390ad8920f70186a...|5390a17720f70186a...|\n",
+      "|5390ad8920f70186a...|5390a2be20f70186a...|\n",
+      "|5390ad8920f70186a...|5390a54620f70186a...|\n",
+      "|5390ad8920f70186a...|539087b320f70186a...|\n",
+      "|5390ad8920f70186a...|5390a72220f70186a...|\n",
+      "|5390ad8920f70186a...|5390aa7620f70186a...|\n",
+      "|5390ad8920f70186a...|5390882c20f70186a...|\n",
+      "|5390ad8920f70186a...|539088b820f70186a...|\n",
+      "|5390ad8920f70186a...|5390962020f70186a...|\n",
+      "+--------------------+--------------------+\n",
+      "only showing top 10 rows\n",
+      "\n"
+     ]
+    }
+   ],
+   "source": [
+    "spark.sql(\"select idx paper_index1, ref paper_index2 from mrg\").show(10)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Step 2. Performing Graph Analytics"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "#### Step 2.1 Visualize In-Degree Distribution"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Assign a numeric id to every index in table, and save new table"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 11,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "inds: org.apache.spark.rdd.RDD[(String, Long)] = ZippedWithIndexRDD[41] at zipWithIndex at <console>:38\n"
+      ]
+     },
+     "execution_count": 11,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "val inds= mrg.toDF().select(explode(array(\"idx\",\"ref\"))).distinct.rdd.map(_.getAs[String](0)).zipWithIndex"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 12,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "res7: Long = 1392313\n"
+      ]
+     },
+     "execution_count": 12,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "inds.count()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 13,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "hash_cols: Seq[String] = List(paper, hash)\n"
+      ]
+     },
+     "execution_count": 13,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "val hash_cols=Seq(\"paper\", \"hash\")\n",
+    "inds.toDF(hash_cols:_*).createOrReplaceTempView(\"hashtbl\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Merge IDs for the index into a table"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 14,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "tmp: org.apache.spark.sql.DataFrame = [idx: string, hash_idx: bigint ... 1 more field]\n"
+      ]
+     },
+     "execution_count": 14,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "val tmp=spark.sql(\"select distinct idx, hash hash_idx, ref from mrg left join hashtbl on mrg.idx=hashtbl.paper\")\n",
+    "tmp.createOrReplaceTempView(\"tmp\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Merge IDs for the references into a table"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 15,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "+--------------------+--------+--------------------+--------+\n",
+      "|                 idx|hash_idx|                 ref|hash_ref|\n",
+      "+--------------------+--------+--------------------+--------+\n",
+      "|5390aeba20f70186a...|   19079|5390877920f70186a...|    1335|\n",
+      "|5390aa7620f70186a...|   26871|5390877920f70186a...|    1335|\n",
+      "|5390aaf920f70186a...|  151747|5390877920f70186a...|    1335|\n",
+      "|5390880720f70186a...|  174146|5390877920f70186a...|    1335|\n",
+      "|5390a2e920f70186a...|  196698|5390877920f70186a...|    1335|\n",
+      "|5390bb7b20f70186a...|  332552|5390877920f70186a...|    1335|\n",
+      "|5390a01420f70186a...|  384436|5390877920f70186a...|    1335|\n",
+      "|5590a8e20cf2baaad...|  562588|5390877920f70186a...|    1335|\n",
+      "|5390a9a520f70186a...|  868474|5390877920f70186a...|    1335|\n",
+      "|5390879220f70186a...|  906177|5390877920f70186a...|    1335|\n",
+      "+--------------------+--------+--------------------+--------+\n",
+      "only showing top 10 rows\n",
+      "\n"
+     ]
+    },
+    {
+     "data": {
+      "text/plain": [
+       "tmp2: org.apache.spark.sql.DataFrame = [idx: string, hash_idx: bigint ... 2 more fields]\n"
+      ]
+     },
+     "execution_count": 15,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "val tmp2=spark.sql(\"select distinct tmp.idx, tmp.hash_idx, tmp.ref, hashtbl.hash hash_ref from tmp left join hashtbl on tmp.ref=hashtbl.paper where tmp.hash_idx is not null and hashtbl.hash is not null\")\n",
+    "tmp2.show(10)\n",
+    "tmp2.createOrReplaceTempView(\"tmp2\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Grab only the numeric IDs to work with"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 16,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "tmp3: org.apache.spark.sql.DataFrame = [hash_idx: bigint, hash_ref: bigint]\n"
+      ]
+     },
+     "execution_count": 16,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "val tmp3 = spark.sql(\"select hash_idx, hash_ref from tmp2\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 17,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "+--------+--------+\n",
+      "|hash_idx|hash_ref|\n",
+      "+--------+--------+\n",
+      "|   19079|    1335|\n",
+      "|  151747|    1335|\n",
+      "|  174146|    1335|\n",
+      "+--------+--------+\n",
+      "only showing top 3 rows\n",
+      "\n"
+     ]
+    }
+   ],
+   "source": [
+    "tmp3.show(3)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Turn into edge mapping"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 18,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "edges: org.apache.spark.rdd.RDD[(Long, Long)] = MapPartitionsRDD[134] at map at <console>:38\n"
+      ]
+     },
+     "execution_count": 18,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "val edges=tmp3.rdd.map(_.mkString(\"\\t\")).map(line=>line.split(\"\\t\")).map(x=>(x(0).toLong, x(1).toLong))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 19,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "(19079,1335)\n",
+      "(26871,1335)\n",
+      "(151747,1335)\n",
+      "(174146,1335)\n",
+      "(196698,1335)\n"
+     ]
+    }
+   ],
+   "source": [
+    "edges.take(5).foreach(println)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Turn into graph mapping"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 20,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "graph: org.apache.spark.graphx.Graph[Null,Int] = org.apache.spark.graphx.impl.GraphImpl@3116b0b5\n"
+      ]
+     },
+     "execution_count": 20,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "val graph = Graph.fromEdgeTuples(edges,null)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Find the number of vertices"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 21,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "nv: Long = 1392313\n"
+      ]
+     },
+     "execution_count": 21,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "val nv=graph.numVertices"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Get the in-degrees for each node"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 22,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "(913000,28)\n",
+      "(9200,11)\n",
+      "(1258800,1)\n",
+      "(172600,1)\n",
+      "(628800,11)\n",
+      "(1154200,2)\n",
+      "(588600,2)\n",
+      "(950200,9)\n",
+      "(88400,1)\n",
+      "(1257400,1)\n"
+     ]
+    },
+    {
+     "data": {
+      "text/plain": [
+       "inDeg: org.apache.spark.graphx.VertexRDD[Int] = VertexRDDImpl[149] at RDD at VertexRDD.scala:57\n"
+      ]
+     },
+     "execution_count": 22,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "val inDeg=graph.inDegrees\n",
+    "inDeg.take(10).foreach(println)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Extract only the in-degrees, and count # of occurences of each in-degree value"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 23,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "(3113,1)\n",
+      "(385,10)\n",
+      "(547,2)\n",
+      "(709,2)\n",
+      "(22,4193)\n",
+      "(3069,1)\n",
+      "(880,5)\n",
+      "(430,6)\n",
+      "(386,6)\n",
+      "(548,1)\n",
+      "(881,4)\n",
+      "(999,1)\n",
+      "(23,3709)\n",
+      "(387,8)\n",
+      "(549,3)\n",
+      "(882,4)\n",
+      "(24,3632)\n",
+      "(431,6)\n",
+      "(388,6)\n",
+      "(432,10)\n",
+      "(883,2)\n",
+      "(270,11)\n",
+      "(25,3199)\n",
+      "(2063,1)\n",
+      "(1172,1)\n"
+     ]
+    },
+    {
+     "data": {
+      "text/plain": [
+       "onlyDeg: org.apache.spark.rdd.RDD[String] = MapPartitionsRDD[150] at map at <console>:38\n",
+       "countDeg: org.apache.spark.rdd.RDD[(String, Int)] = ShuffledRDD[152] at reduceByKey at <console>:39\n"
+      ]
+     },
+     "execution_count": 23,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "val onlyDeg=inDeg.map(x=>x.toString.split(\",\")(1).replaceAll(\"\\\\)\", \"\"))\n",
+    "val countDeg=onlyDeg.map(x=>(x,1)).reduceByKey((v1,v2)=>v1+v2)\n",
+    "countDeg.take(25).foreach(println)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Output file of form (k, p(k)) where k is in-degree value and p(k) is probability"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 24,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "(3113,7.1822933E-7)\n",
+      "(385,7.182293E-6)\n",
+      "(547,1.4364587E-6)\n",
+      "(709,1.4364587E-6)\n",
+      "(22,0.0030115354)\n",
+      "(3069,7.1822933E-7)\n",
+      "(880,3.5911464E-6)\n",
+      "(430,4.309376E-6)\n",
+      "(386,4.309376E-6)\n",
+      "(548,7.1822933E-7)\n"
+     ]
+    },
+    {
+     "data": {
+      "text/plain": [
+       "pk: org.apache.spark.rdd.RDD[(String, Float)] = MapPartitionsRDD[153] at map at <console>:38\n"
+      ]
+     },
+     "execution_count": 24,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "val pk = countDeg.map(x=>(x.toString.split(\",\")(0).replaceAll(\"\\\\(\", \"\"), x.toString.split(\",\")(1).replaceAll(\"\\\\)\", \"\").toFloat/1392313))\n",
+    "\n",
+    "pk.take(10).foreach(println)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 25,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "pk.coalesce(1, true).saveAsTextFile(\"hdfs://bd-hm:9000/hadoop-user/data/acm_output\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "#### Step 2.2 Implement Weighted Page Rank Algorithm"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 26,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "tmp3.createOrReplaceTempView(\"tmp3\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Using numeric IDs, create a table of the inlinks for every paper"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 27,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "spark.sql(\"select a.hash_idx, count (b.hash_ref) num from tmp3 a left join tmp3 b on a.hash_ref=b.hash_idx group by a.hash_idx\").createOrReplaceTempView(\"fr\")\n",
+    "spark.sql(\"select distinct a.hash_idx, a.hash_ref, num from tmp3 a left join fr b where a.hash_ref=b.hash_idx\").createOrReplaceTempView(\"sec\")\n",
+    "spark.sql(\"select sec.hash_idx, sum(sec.num) den from sec group by sec.hash_idx\").createOrReplaceTempView(\"th\")\n",
+    "spark.sql(\"select sec.hash_idx, sec.hash_ref, (num*(1.0/den)) inweight from sec left join th on sec.hash_idx=th.hash_idx\").createOrReplaceTempView(\"inweight\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Using numeric IDs, create a table of the outlinks for every paper"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 28,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "spark.sql(\"select a.hash_ref, count (b.hash_idx) num from tmp3 a left join tmp3 b on a.hash_ref=b.hash_ref group by a.hash_ref, a.hash_idx\").createOrReplaceTempView(\"ofr\")\n",
+    "spark.sql(\"select distinct a.hash_ref, a.hash_idx, num from tmp3 a left join ofr b where a.hash_idx=b.hash_ref\").createOrReplaceTempView(\"osec\")\n",
+    "spark.sql(\"select osec.hash_ref, sum(osec.num) den from osec group by osec.hash_ref\").createOrReplaceTempView(\"oth\")\n",
+    "spark.sql(\"select distinct osec.hash_idx, osec.hash_ref, (num*(1.0/den)) outweight from osec left join oth on osec.hash_idx=oth.hash_ref\").createOrReplaceTempView(\"outweight\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Merge together inlinks and outlinks for every paper, into a single table"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 29,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "+--------+--------+------------------+------------------+\n",
+      "|hash_idx|hash_ref|          inweight|         outweight|\n",
+      "+--------+--------+------------------+------------------+\n",
+      "|    4502| 1309517|1.0000000000000000|0.8333333333333333|\n",
+      "|    2955| 1360875|1.0000000000000000|              null|\n",
+      "|   11181|  630024|1.0000000000000000|              null|\n",
+      "|     500|  411421|1.0000000000000000|0.3000000000000000|\n",
+      "|    1191|  853132|1.0000000000000000|0.2000000000000000|\n",
+      "+--------+--------+------------------+------------------+\n",
+      "only showing top 5 rows\n",
+      "\n"
+     ]
+    }
+   ],
+   "source": [
+    "spark.sql(\"select i.hash_idx, i.hash_ref, i.inweight, o.outweight from inweight i left join outweight o on i.hash_idx=o.hash_idx and i.hash_ref=o.hash_ref order by inweight desc\").createOrReplaceTempView(\"joinweights\")\n",
+    "spark.sql(\"select * from joinweights\").show(5)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Set the initialized PageRank to be 1/N for every paper"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 30,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "+---------+--------------------+\n",
+      "|hash_ref2|                  pw|\n",
+      "+---------+--------------------+\n",
+      "|   564849|7.182293061976725E-7|\n",
+      "|   551749|7.182293061976725E-7|\n",
+      "|   492862|7.182293061976725E-7|\n",
+      "|   840430|7.182293061976725E-7|\n",
+      "|   126557|7.182293061976725E-7|\n",
+      "+---------+--------------------+\n",
+      "only showing top 5 rows\n",
+      "\n"
+     ]
+    }
+   ],
+   "source": [
+    "spark.sql(\"select distinct hash_idx hash_ref2, (1/1392313) pw from tmp3\").createOrReplaceTempView(\"pweights\")\n",
+    "spark.sql(\"select * from pweights\").show(5)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Set number of loops for algorithm"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 31,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "nums: Seq[Int] = List(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)\n"
+      ]
+     },
+     "execution_count": 31,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "val nums = Seq(1,2,3,4,5,6,7,8,9,10)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Iterate through 10 loops of page rank algorithm, calculating new page ranks and updating the table each iteration"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 32,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "for (i <- nums){\n",
+    "    spark.sql(\"select j.hash_idx, j.hash_ref, j.inweight, j.outweight, (0.85*j.outweight*j.inweight*p.pw) mult from joinweights j left join pweights p on j.hash_idx=p.hash_ref2\").createOrReplaceTempView(\"joinweights2\")\n",
+    "    spark.sql(\"select j.hash_ref hash_ref2, sum(j.mult)+0.05 pw from joinweights2 j group by j.hash_ref\").createOrReplaceTempView(\"pweights\")\n",
+    "}"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Print top 10 pageranks"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 33,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "spark.sql(\"select * from pweights order by pw desc limit 10\").createOrReplaceTempView(\"top10\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 34,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "+---------+------------------+\n",
+      "|hash_ref2|                pw|\n",
+      "+---------+------------------+\n",
+      "|   146305|6.0088478709842095|\n",
+      "|   536724| 5.948180500675987|\n",
+      "|  1366018| 4.265012564707153|\n",
+      "|   710879|3.7043925547376344|\n",
+      "|  1364986| 3.282019487731513|\n",
+      "|   104652| 3.190632199127757|\n",
+      "|   949386|3.1633427126114424|\n",
+      "|   760815|3.0708208719516668|\n",
+      "|  1135131|2.8489140700311086|\n",
+      "|   738383| 2.634768757124643|\n",
+      "+---------+------------------+\n",
+      "\n"
+     ]
+    }
+   ],
+   "source": [
+    "spark.sql(\"select * from top10\").show()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 36,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "spark.sql(\"select distinct ind.id paper_title, i.num number_of_in_links, tt.pw page_rank from top10 tt left join fr i on i.hash_idx=tt.hash_ref2 left join tmp2 on tmp2.hash_idx=tt.hash_ref2 left join index ind on ind.idx=tmp2.idx\").createOrReplaceTempView(\"mrg_output\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 37,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "mrg_output2: org.apache.spark.sql.DataFrame = [paper_title: string, number_of_in_links: bigint ... 1 more field]\n",
+       "mrg_output3: org.apache.spark.rdd.RDD[String] = MapPartitionsRDD[702] at map at <console>:37\n"
+      ]
+     },
+     "execution_count": 37,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "val mrg_output2 = spark.sql(\"select * from mrg_output\")\n",
+    "val mrg_output3 = mrg_output2.rdd.map(x=>x.mkString(\"\\t\"))\n",
+    "mrg_output3.coalesce(1, true).saveAsTextFile(\"hdfs://bd-hm:9000/hadoop-user/data/paper_rank\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "#### Step 2.3 Finding Average Clustring Coefficient"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Calculate triangle count"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 38,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "triagCount: org.apache.spark.graphx.Graph[Int,Int] = org.apache.spark.graphx.impl.GraphImpl@ccdcc75\n"
+      ]
+     },
+     "execution_count": 38,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "val triagCount = graph.triangleCount\n",
+    "triagCount.vertices.toDF(\"id\", \"tv\").createOrReplaceTempView(\"triagCount\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Calculate degrees for each vertex"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 39,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "deg: org.apache.spark.graphx.VertexRDD[Int] = VertexRDDImpl[763] at RDD at VertexRDD.scala:57\n"
+      ]
+     },
+     "execution_count": 39,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "val deg = graph.degrees\n",
+    "deg.toDF(\"id\", \"kv\").createOrReplaceTempView(\"deg\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Calculate clustering coefficient for each node"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 40,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "spark.sql(\"select triagCount.id, triagCount.tv, deg.kv, (2*triagCount.tv)/(deg.kv*(deg.kv-1)) cc from triagCount left join deg on triagCount.id=deg.id\").createOrReplaceTempView(\"cc_tb\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 42,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "cc_tb2: org.apache.spark.sql.DataFrame = [id: bigint, tv: int ... 2 more fields]\n",
+       "cc_tb3: org.apache.spark.rdd.RDD[org.apache.spark.sql.Row] = MapPartitionsRDD[777] at rdd at <console>:37\n"
+      ]
+     },
+     "execution_count": 42,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "val cc_tb2 = spark.sql(\"select * from cc_tb\")\n",
+    "val cc_tb3 = cc_tb2.rdd\n",
+    "cc_tb3.coalesce(1, true).saveAsTextFile(\"hdfs://bd-hm:9000/hadoop-user/data/localCC\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Calculate average clustering coefficient"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 43,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "spark.sql(\"select avg(cc) from cc_tb where cc is not null\").createOrReplaceTempView(\"avgcc\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 44,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "avgcc2: org.apache.spark.sql.DataFrame = [avg(cc): double]\n",
+       "avgcc3: org.apache.spark.rdd.RDD[org.apache.spark.sql.Row] = MapPartitionsRDD[799] at rdd at <console>:37\n"
+      ]
+     },
+     "execution_count": 44,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "val avgcc2 = spark.sql(\"select * from avgcc\")\n",
+    "val avgcc3 = avgcc2.rdd\n",
+    "avgcc3.coalesce(1, true).saveAsTextFile(\"hdfs://bd-hm:9000/hadoop-user/data/AverageCC\")"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "spylon-kernel",
+   "language": "scala",
+   "name": "spylon-kernel"
+  },
+  "language_info": {
+   "codemirror_mode": "text/x-scala",
+   "file_extension": ".scala",
+   "help_links": [
+    {
+     "text": "MetaKernel Magics",
+     "url": "https://metakernel.readthedocs.io/en/latest/source/README.html"
+    }
+   ],
+   "mimetype": "text/x-scala",
+   "name": "scala",
+   "pygments_lexer": "scala",
+   "version": "0.4.1"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 2
+}
